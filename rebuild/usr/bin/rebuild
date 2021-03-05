@@ -1,0 +1,35 @@
+#!/bin/bash
+
+set -e
+set -x
+
+env
+
+for dist in $INPUT_DIST; do
+  for arch in $INPUT_ARCH; do 
+    if [ ! -d "dists/$dist/main/binary-$arch" ]; then
+      mkdir -p dists/$dist/main/binary-$arch
+    fi
+
+    PACKAGES=dists/$dist/main/binary-$arch/Packages
+    if [ -d .dists/$dist/main ]; then
+      find .dists/$dist/main \( -name "*_$arch.dsc" -or -name "*_all.dsc" \) -exec cat {} \; -printf "\n" > $PACKAGES
+    else
+      touch $PACKAGES
+    fi
+    xz -kf $PACKAGES
+  done
+  apt-ftparchive release -c /etc/apt/apt-release-$dist.conf dists/$dist > dists/$dist/Release
+done
+
+git config --global user.email "$INPUT_EMAIL"
+git config --global user.name "$INPUT_NAME"
+
+URL=$(git remote get-url origin)
+
+rm -rf .git
+git init
+git add .
+git commit -m "Rebuild"
+git remote add origin ${URL/\/\//\/\/$GITHUB_ACTOR:$INPUT_TOKEN@}
+git push -u --force origin master

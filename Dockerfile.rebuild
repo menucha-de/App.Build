@@ -1,0 +1,9 @@
+FROM debian:buster-slim
+
+RUN apt-get -qq update && \
+    apt-get -qq install --no-install-recommends git apt-utils xz-utils ca-certificates && \
+    apt-get clean && rm /var/lib/apt/lists/*_*
+
+ADD rebuild /
+
+ENTRYPOINT ["/usr/bin/rebuild"]

@@ -1,0 +1,207 @@
+ROOT=$(mktemp -d)
+CACHE=$(mktemp -d)
+
+assume() {
+  name=$1
+  arch=$2
+  version=$3
+  cat >> $ROOT/var/lib/dpkg/status <<EOF
+Package: $name
+Status: install ok installed
+Architecture: $arch
+Version: $version
+
+EOF
+}
+
+init() {
+  mkdir -p $ROOT/etc/apt/sources.list.d $ROOT/etc/apt/preferences.d $ROOT/var/lib/apt $ROOT/var/cache/apt/archives $ROOT/var/lib/dpkg
+  cp -a /etc/apt/trusted.gpg.d $ROOT/etc/apt/
+
+  echo "deb [trusted=yes] $APT $DIST main" > $ROOT/etc/apt/sources.list.d/local.list
+  if [ "${DIST//*-}" = "staging" ]; then
+    echo "deb [trusted=yes] $APT ${DIST%%-*} main" >> $ROOT/etc/apt/sources.list.d/local.list
+  fi
+
+  assume debconf-2.0 all 2.0
+  assume init-system-helpers all 2.0
+
+  echo "deb $MIRROR ${DIST%%-*} main" > $ROOT/etc/apt/sources.list
+  
+  cat > Dockerfile <<EOF
+FROM scratch
+ARG TARGETARCH
+LABEL maintainer="$MAINTAINER"
+LABEL support="$SUPPORT"
+EOF
+}
+
+update() {
+  apt-get -o Dir=$ROOT update
+}
+
+setup() {
+  if [ ! -f patternfile ]; then
+    echo "::warning::Expected 'patternfile' in repository."
+  fi
+  for arch in $ARCH; do
+    apt-get -o Dir=$ROOT -o Dir::Cache::Archives=$CACHE -o APT::Architecture=$arch -f -y -d --no-install-recommends install -t stable $@
+  done
+  for i in $(cd $CACHE; ls *.deb); do
+    name=${i/_*_/_}
+    name=${name/_armhf./_arm.}
+    echo "Converting $i"
+    dpkg --fsys-tarfile $CACHE/$i | tar --wildcards --delete -T patternfile | gzip -n > ${name/.deb}.tar.gz
+    touch ${name/.deb}.tar.gz -r $CACHE/$i
+  done
+  for i in $(cd $CACHE; ls *.deb | cut -d"_" -f1 | sort | uniq); do
+    echo "Adding $i"
+    if [ -f "${i}_all.tar.gz" ]; then
+      echo "ADD ${i}_all.tar.gz /" >> Dockerfile
+    else
+      echo "ADD ${i}_\$TARGETARCH.tar.gz /" >> Dockerfile
+    fi
+  done
+  if [ -d rfs ]; then
+    echo "ADD rfs /" >> Dockerfile
+  fi
+}
+
+finish() {
+  workdir=$1
+  entrypoint=$2
+  cat >> Dockerfile <<EOF
+WORKDIR $workdir
+ENTRYPOINT $entrypoint
+EOF
+  cat Dockerfile
+}
+
+publish() {
+  repo=$1
+  path=$2
+  name=$(basename $path)
+  if [ -f $path ]; then
+    file=$path
+  else
+    file=$name
+  fi
+  accept="Accept: application/vnd.github.v3+json"
+  auth="Authorization: token $TOKEN"
+  url=$GITHUB_API_URL/repos/$ORG/$repo/contents/$path
+  for attempts in 1 2 3
+  do
+    sha=$(curl -s -S -f -H "$auth" ${url%/*} | jq -r '.[] | try select(.path == "'$path'") | .sha')
+    if [ -n "$sha" ]; then
+      sha=', "sha": "'$sha'"'
+    fi
+    
+    cat <(echo -n '{"message": "Adds '$name'", "content": "') <(base64 -w0 $file) <(echo -n '"'$sha'}') \
+    | curl -s -S -f -H "$auth" -H "$accept" -X PUT $url -d @- && break
+
+    if [ $attempts -lt 3 ]; then
+      sleep 5
+    else
+      echo "::error::Failed to publish $path to $repo: See log for details"
+      return 1
+    fi
+  done
+}
+
+publish_deb() {
+  FILE=$1
+  PACKAGE=$(dpkg -f -- $FILE Package)
+  SOURCE=$(dpkg -f -- $FILE Source)
+  if [ -z "$SOURCE" ]; then
+    SOURCE=$PACKAGE
+  fi
+  if [ "${SOURCE:0:3}" == "lib" ]; then
+    DIR=${SOURCE:0:4}
+  else
+    DIR=${SOURCE:0:1}
+  fi
+  FILEPATH=pool/main/$DIR/$SOURCE/$FILE
+  MD5=$(md5sum $FILE)
+  SHA1=$(sha1sum $FILE)
+  SHA256=$(sha256sum $FILE)
+  SUMS="MD5sum: ${MD5:0:32}\nSHA1: ${SHA1:0:40}\nSHA256: ${SHA256:0:64}"
+  SIZE="Size: $(stat -c "%s" $FILE)"
+  FILENAME="Filename: $FILEPATH"
+  ARCH=$(dpkg -f -- $FILE Architecture)    
+  DSC=${PACKAGE}_${ARCH}.dsc
+  dpkg -I $FILE control | sed "/^Description:/i $FILENAME\n$SIZE\n$SUMS" > $DSC
+
+  publish debian $FILEPATH
+  publish debian .dists/$DIST/main/$DSC
+}
+
+publish_debs() {
+  cd target
+  for package in *_*.deb; do
+    publish_deb $package
+  done
+  cd -
+}
+
+set_env() {
+  arch=$1
+  case "$arch" in
+    armhf)
+      export GOARCH="arm"
+      export GOARM="7"
+      export PREFIX="arm-linux-gnueabihf-"
+      export JAVA_PLATFORM="linux-arm"
+      ;;
+    amd64)
+      export GOARCH="amd64"
+      unset GOARM
+      unset PREFIX
+      export JAVA_PLATFORM="linux-amd64"
+      ;;
+    all)
+      export JAVA_PLATFORM="linux-all"
+      ;;
+  esac
+  export JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF8
+}
+
+prepare() {
+  echo "deb [trusted=yes] $APT $DIST main" > /etc/apt/sources.list.d/local.list
+  if [ "${DIST//*-}" = "staging" ]; then
+    echo "deb [trusted=yes] $APT ${DIST%%-*} main" >> /etc/apt/sources.list.d/local.list
+  fi
+  apt-get -q update
+}
+
+build() {
+  args=$@
+  prepare
+  for arch in $ARCH; do
+    if [ "$arch" != "all" ]; then
+      set_env $arch
+      ARGS="-a$arch"
+    fi
+    apt-get -q -y build-dep $ARGS .
+    dpkg-buildpackage -j12 $ARGS -i -I -Itarget --no-sign $args
+  done
+  mkdir -p target
+  mv ../*_*.* target
+}
+
+rewrite() {
+  cat >> ~/.gitconfig <<EOF
+[url "${URL/:\/\//:\/\/$ORG:$TOKEN@}/$ORG"]
+  insteadOf = $URL/$ORG
+EOF
+  echo "${NPM#*:}/:_authToken=$TOKEN" >> ~/.npmrc
+}
+
+ant_build() {
+  ant -Dkeyfile=${keyfile} -Divy.resolver=${RESOLVER} -Divy.settings=ivysettings_remote.xml -Divy.url=${IVY} -Dapi.url=${API} -Dplatform=${JAVA_PLATFORM} -Djavac.debug=${DEBUG} $@
+}
+
+publish_ivy() {
+  cd $1
+  find * -type f | while read package; do publish ivy "$package"; done
+  cd -
+}
