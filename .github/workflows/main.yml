@@ -8,7 +8,7 @@ on:
         required: true
       tags:
         description: 'Tags'
-        default: 'ghcr.io/peramic/build:latest'
+        default: 'ghcr.io/menucha-de/build:latest'
         required: true
       platforms:
         description: 'Platforms'
