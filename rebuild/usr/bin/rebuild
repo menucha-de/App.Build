@@ -32,4 +32,4 @@ git init
 git add .
 git commit -m "Rebuild"
 git remote add origin ${URL/\/\//\/\/$GITHUB_ACTOR:$INPUT_TOKEN@}
-git push -u --force origin master
+git push -u --force origin main
