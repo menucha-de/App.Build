@@ -31,5 +31,6 @@ rm -rf .git
 git init
 git add .
 git commit -m "Rebuild"
+git branch -M main
 git remote add origin ${URL/\/\//\/\/$GITHUB_ACTOR:$INPUT_TOKEN@}
 git push -u --force origin main
